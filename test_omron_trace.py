@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from omron_trace import parse_omron_trace, trace_input_digest
+from trace_to_pairs import parse_omron_trace, trace_input_digest
 
 
 class OmronTraceTests(unittest.TestCase):

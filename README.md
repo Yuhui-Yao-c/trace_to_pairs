@@ -1,6 +1,6 @@
 # Trace 步序对提取
 
-`trace_to_pairs.py` 是 PLC 工作流的运行数据组件。将它和 `omron_trace.py` 放在工作流根目录，复用工程的 `trace_jump_analyzer.py`、工位工具、动作证据读取和变量过滤规则。
+`trace_to_pairs.py` 是 PLC 工作流的运行数据组件。将该脚本放在工作流根目录，复用工程的 `trace_jump_analyzer.py`、工位工具、动作证据读取和变量过滤规则。
 
 ```bash
 python trace_to_pairs.py --trace "采集/OmronTrace" --run "outputs/本次运行" --pattern "m_nNextAutoStep[*]"
@@ -15,7 +15,10 @@ python trace_to_pairs.py --trace "采集/Scope.trace" --run "outputs/本次运�
 
 ## 工作流接口
 
+两种输入都由 `trace_to_pairs.py` 识别和分流。直接运行或调用 `generate()` 时，两种格式都生成同一套步序对产物。
+
 - `generate(trace_path, run, source=None, proc_name=None, ..., pattern=None, sample_interval_ms=None)` 接收文件或目录，直接在 `run` 写入 `trace_collection_pairs.csv`、`trace_pairs_review.csv`、`trace_pairs_summary.json` 及跳变、恒值段、变量、周期审计。动作变量和步注释仍从本次 run 的源码证据补充。
 - `trace_collection_pairs.csv` 保留起止标签、动作证据、次数和中位数、最短、最长时长列，新增 `估算时长次数`。汇总中的 `trace_input` 记录分卷顺序、索引范围、时间来源和缺号。
 - `load_trace_duration_map(run)` 返回由完整起止标签组成的键和中位数时长。`load_trace_timing(run)` 还返回包含估算时长的标签对，供 Excel 标记。
-- 工作流应把同一个 `--trace` 文件或目录传入 `generate()`，同时传递本次变量模式。可用 `omron_trace.trace_input_digest()` 给目录内的 Trace 文件名和文件内容生成指纹。单文件指纹沿用文件内容 SHA-256。
+- 工作流应把同一个 `--trace` 文件或目录传入 `generate()`，同时传递本次变量模式。可用 `trace_to_pairs.trace_input_digest()` 给目录内的 Trace 文件名和文件内容生成指纹。单文件指纹沿用文件内容 SHA-256。
+- v9.25 交付适配调用 `analyze_for_workflow()`。Sysmac 使用观测步序对回填，TwinCAT 沿用该版本原有的预测对匹配和时长产物。

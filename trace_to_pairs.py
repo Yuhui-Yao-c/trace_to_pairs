@@ -313,8 +313,8 @@ def generate(trace_path, run, source=None, proc_name=None,
             bare = re.sub(r'\[\d+\]', '', var_name)
             action_vars = amap.get((bare, str(from_int)), [])
 
-        # Step comment: prefer start label, fallback end label
-        sc = sc_map.get(start_label, '') or sc_map.get(end_label, '')
+        # The measured dwell and its step comment belong to the start state.
+        sc = sc_map.get(start_label, '')
 
         # Station name for grouping
         ws_name = _station_name(var_name, si_map, var_docs)

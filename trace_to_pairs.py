@@ -31,8 +31,8 @@ Outputs (in run dir):
   trace_jumps.csv             — all raw jumps (audit)
   trace_segments.csv          — all value segments (audit)
   trace_cycles.json           — cycle boundary timestamps (audit)
-  trace_pairs_review.csv      — pairs whose variable is absent from source
-                                candidate pool (no action-variable mapping)
+  trace_pairs_review.csv      — pairs missing a source action mapping for the
+                                variable or the start step
   trace_pairs_summary.json    — run-level stats
 
 Isolation: reads only the trace file + source-derived evidence files in run
@@ -288,10 +288,7 @@ def generate(trace_path, run, source=None, proc_name=None,
     si_map = load_station_identity(str(run))
     var_docs = _load_var_docs(str(run))
 
-    # Track which trace variables have action-variable mappings (for review).
-    mapped_vars = set()
-    for (sv, _val) in amap.keys():
-        mapped_vars.add(sv)
+    mapped_vars = {sv for sv, _ in amap}
 
     # ---- 7. Assemble pair rows ----
     rows = []
@@ -303,15 +300,14 @@ def generate(trace_path, run, source=None, proc_name=None,
         end_label = _label(var_name, to_int)
         is_reset = (to_int == 0)
 
-        # Action variables: (state_variable, state_value) -> [syms]
-        # Key uses the bare state variable (no [idx]) to match amap keys
-        # which come from plcopen_action_trace.csv state_variable column.
-        sv_key = var_name  # amap keys are like 'EM06V.Process_steps[1]'
-        action_vars = amap.get((sv_key, str(from_int)), [])
-        if not action_vars:
-            # Try without index (some action traces use bare array var)
-            bare = re.sub(r'\[\d+\]', '', var_name)
-            action_vars = amap.get((bare, str(from_int)), [])
+        # Some source action maps store the array name without its index.
+        step_value = str(from_int)
+        bare_var = re.sub(r'\[\d+\]', '', var_name)
+        action_vars = amap.get((var_name, step_value), [])
+        used_unindexed_mapping = False
+        if not action_vars and bare_var != var_name:
+            action_vars = amap.get((bare_var, step_value), [])
+            used_unindexed_mapping = bool(action_vars)
 
         # The measured dwell and its step comment belong to the start state.
         sc = sc_map.get(start_label, '')
@@ -327,13 +323,26 @@ def generate(trace_path, run, source=None, proc_name=None,
         remark = []
         if is_reset:
             remark.append('复位退出')
-        has_action_vars = bool(action_vars)
-        if var_name not in mapped_vars:
-            remark.append('源码无动作变量映射')
-        elif not has_action_vars:
-            remark.append('该步值无动作变量')
-        if not sc and not has_action_vars:
-            remark.append('无步注释')
+        if used_unindexed_mapping:
+            remark.append('动作变量命中无下标映射（槽位待核）')
+        if not action_vars:
+            if var_name in mapped_vars or bare_var in mapped_vars:
+                remark.append('该步值无动作变量')
+                review_type = 'no_action_for_step_value'
+                review_note = f'{start_label} 在源码动作变量映射中无对应动作'
+            else:
+                remark.append('源码无动作变量映射')
+                review_type = 'no_action_mapping'
+                review_note = f'trace变量 {var_name} 不在源码动作变量映射中'
+            if not sc:
+                remark.append('无步注释')
+            review_rows.append({
+                '类型': review_type,
+                '变量': var_name,
+                '开始标签': start_label,
+                '结束标签': end_label,
+                '说明': review_note,
+            })
 
         rows.append({
             '构成要素': ws_name,
@@ -357,23 +366,6 @@ def generate(trace_path, run, source=None, proc_name=None,
             '所属周期数': n_cycles,
             '备注': ' | '.join(remark),
         })
-
-        if var_name not in mapped_vars:
-            review_rows.append({
-                '类型': 'no_action_mapping',
-                '变量': var_name,
-                '开始标签': start_label,
-                '结束标签': end_label,
-                '说明': f'trace变量 {var_name} 不在源码动作变量映射中',
-            })
-        elif not has_action_vars:
-            review_rows.append({
-                '类型': 'no_action_for_step_value',
-                '变量': var_name,
-                '开始标签': start_label,
-                '结束标签': end_label,
-                '说明': f'{var_name}={from_int} 在源码动作变量映射中无对应动作',
-            })
 
     # Sort: by station sort key, then variable, then from-value
     rows.sort(key=lambda r: (em_sort_key_prefixed(r['构成要素']),

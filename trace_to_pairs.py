@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """v9.28 trace → step-pair extraction.
 
-Reuses trace_jump_analyzer.parse_trace() (UTF-16 TwinCAT Scope .trace parser)
-to obtain per-variable value/timestamp series, then converts adjacent jumps
-into state-transition pairs of the same shape as prediction_collection_pairs.csv
+Reads TwinCAT Scope .trace XML via trace_jump_analyzer or Sysmac Studio trace
+tables via omron_trace. Converts adjacent observed jumps into state-transition
+pairs of the same shape as prediction_collection_pairs.csv
 so downstream action_describe.py (A/B-tier) and gen_workstation_xlsx.py can be
 reused without modification.
 
@@ -35,7 +35,7 @@ Outputs (in run dir):
                                 variable or the start step
   trace_pairs_summary.json    — run-level stats
 
-Isolation: reads only the trace file + source-derived evidence files in run
+Isolation: reads only the trace input + source-derived evidence files in run
 (plcopen_action_trace.csv, step_comments.json, station_identity.json,
 variable_documentation.json). Never opens GT or manual tables.
 """
@@ -48,10 +48,19 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-# Reuse the proven trace parser — it already handles UTF-16 + <TraceVariable>.
+from omron_trace import is_omron_trace_input, parse_omron_trace
 from trace_jump_analyzer import parse_trace, detect_cycles, _write_csv
-# v9.28: shared utilities (eliminates duplication with gen_stepvars_xlsx).
-from utils import load_station_identity, infer_proc_name, em_sort_key_prefixed
+
+try:
+    from utils import load_station_identity, infer_proc_name, em_sort_key_prefixed
+except ModuleNotFoundError as exc:
+    if exc.name != 'utils':
+        raise
+    # Earlier workflow versions keep these helpers in the workstation writer.
+    from gen_workstation_xlsx import load_station_identity, _em_sort_key as em_sort_key_prefixed
+
+    def infer_proc_name(source, run, proc_name):
+        return proc_name or (Path(source).stem if source else Path(run).name)
 
 
 # State-variable symbol regex (same shape as gen_stepvars_xlsx._SYMBOL_RE).
@@ -132,7 +141,12 @@ def _load_action_map(run):
 
 def _station_name(var_name, si_map, var_docs):
     """Resolve display station name for a trace variable."""
+    exact = si_map.get(var_name)
+    if exact and exact.get('display'):
+        return exact['display']
     root = _var_root(var_name)
+    if var_name.startswith(root + '[') and '.' not in var_name:
+        return var_name
     si = si_map.get(root)
     if si and si.get('display'):
         return si['display']
@@ -150,18 +164,19 @@ PAIR_FIELDS = [
     '证据POU', '证据节点', '原始条件', '控制器', '分支数',
     # Runtime columns (trace-specific):
     '动作变量', '发生次数', '中位数时长ms', '最小时长ms', '最大时长ms',
-    '首次时间ms', '末次时间ms', '所属周期数', '备注',
+    '首次时间ms', '末次时间ms', '所属周期数', '备注', '估算时长次数',
 ]
 
 
 def generate(trace_path, run, source=None, proc_name=None,
-             idle_threshold_ms=5000):
+             idle_threshold_ms=5000, *, pattern=None, sample_interval_ms=None):
     """Run the full trace → pairs extraction.
 
     Parameters
     ----------
     trace_path : str
-        Path to the .trace file (TwinCAT Scope, UTF-16 XML).
+        TwinCAT Scope .trace file, Sysmac CSV/TSV/TXT table, or a directory
+        of Sysmac tables from one recording.
     run : str
         Run output directory (must already contain source-derived evidence
         files from a prior workflow.create() call: plcopen_action_trace.csv,
@@ -172,16 +187,31 @@ def generate(trace_path, run, source=None, proc_name=None,
         Override process name.
     idle_threshold_ms : int
         Idle-segment threshold for cycle detection (ms).
+    pattern : str, optional
+        Workflow glob or re: pattern applied to the full variable name.
+    sample_interval_ms : float, optional
+        Sysmac sample period for timing reconstruction when RawTime is rounded.
 
     Returns
     -------
     dict with run stats and output paths.
     """
     run = Path(run)
-    run.mkdir(parents=True, exist_ok=True)
+    matches = None
+    if pattern:
+        from candidate_filter import glob_regex
+        matches = glob_regex(pattern).fullmatch
 
-    # ---- 1. Parse trace (reuse trace_jump_analyzer) ----
-    variables = parse_trace(trace_path)
+    # ---- 1. Normalize the trace input ----
+    if is_omron_trace_input(trace_path):
+        variables, trace_input = parse_omron_trace(
+            trace_path, sample_interval_ms=sample_interval_ms, matches=matches)
+    else:
+        variables = parse_trace(trace_path)
+        if matches is not None:
+            variables = {name: vd for name, vd in variables.items() if matches(name)}
+        trace_input = {'format': 'twincat_scope_xml'}
+    run.mkdir(parents=True, exist_ok=True)
     active_count = sum(1 for v in variables.values() if not v['inactive'])
     inactive_count = sum(1 for v in variables.values() if v['inactive'])
 
@@ -251,6 +281,7 @@ def generate(trace_path, run, source=None, proc_name=None,
     pair_first_ts = {}
     pair_last_ts = {}
     pair_cycles = defaultdict(set)
+    pair_estimated = defaultdict(int)
 
     for name, vd in variables.items():
         if vd['inactive']:
@@ -262,8 +293,10 @@ def generate(trace_path, run, source=None, proc_name=None,
         # only ran one cycle, its first transition was lost forever — e.g.
         # ST06.AutoStep[2] 50->60, ST07.AutoStep[1] 45->50.)
         first_sample_ts = int(vd['time_range'][0])
+        dwell_starts = vd.get('dwell_starts')
+        estimated_dwells = vd.get('estimated_dwells', ())
         for k in range(len(jumps)):
-            _, from_v, to_v, ts = jumps[k]
+            idx, from_v, to_v, ts = jumps[k]
             # Skip degenerate self-loops (from==to).  These arise when a
             # variable briefly flickers and returns to the same value within
             # one sample period — they are not real state transitions.
@@ -273,10 +306,15 @@ def generate(trace_path, run, source=None, proc_name=None,
             # moving to to_v.  For k=0 there is no previous jump, so use
             # the variable's first-sample timestamp (initial state dwell
             # time from sampling start to first transition).
-            prev_ts = first_sample_ts if k == 0 else jumps[k - 1][3]
+            if dwell_starts is not None:
+                prev_ts = dwell_starts[idx]
+            else:
+                prev_ts = first_sample_ts if k == 0 else jumps[k - 1][3]
             dur = ts - prev_ts
             key = (name, from_v, to_v)
             pair_durations[key].append(int(dur))
+            if idx in estimated_dwells:
+                pair_estimated[key] += 1
             if key not in pair_first_ts:
                 pair_first_ts[key] = int(prev_ts)
             pair_last_ts[key] = int(ts)
@@ -293,7 +331,8 @@ def generate(trace_path, run, source=None, proc_name=None,
     # ---- 7. Assemble pair rows ----
     rows = []
     review_rows = []
-    for (var_name, from_v, to_v), durs in pair_durations.items():
+    for key, durs in pair_durations.items():
+        var_name, from_v, to_v = key
         from_int = _val_to_int(from_v)
         to_int = _val_to_int(to_v)
         start_label = _label(var_name, from_int)
@@ -318,11 +357,14 @@ def generate(trace_path, run, source=None, proc_name=None,
         median_dur = int(round(statistics.median(durs)))
         min_dur = int(min(durs))
         max_dur = int(max(durs))
-        n_cycles = len(pair_cycles[(var_name, from_v, to_v)])
+        n_cycles = len(pair_cycles[key])
 
         remark = []
         if is_reset:
             remark.append('复位退出')
+        estimated_count = pair_estimated.get(key, 0)
+        if estimated_count:
+            remark.append(f'含估算时长（{estimated_count}/{len(durs)} 次）')
         if used_unindexed_mapping:
             remark.append('动作变量命中无下标映射（槽位待核）')
         if not action_vars:
@@ -361,10 +403,11 @@ def generate(trace_path, run, source=None, proc_name=None,
             '中位数时长ms': median_dur,
             '最小时长ms': min_dur,
             '最大时长ms': max_dur,
-            '首次时间ms': pair_first_ts[(var_name, from_v, to_v)],
-            '末次时间ms': pair_last_ts[(var_name, from_v, to_v)],
+            '首次时间ms': pair_first_ts[key],
+            '末次时间ms': pair_last_ts[key],
             '所属周期数': n_cycles,
             '备注': ' | '.join(remark),
+            '估算时长次数': estimated_count,
         })
 
     # Sort: by station sort key, then variable, then from-value
@@ -386,6 +429,7 @@ def generate(trace_path, run, source=None, proc_name=None,
 
     summary = {
         'trace_path': str(trace_path),
+        'trace_input': trace_input,
         'run': str(run),
         'proc_name': proc,
         'variables_total': len(variables),
@@ -395,6 +439,7 @@ def generate(trace_path, run, source=None, proc_name=None,
         'total_segments': len(seg_rows),
         'cycles_detected': len(cycle_data),
         'unique_pairs': len(rows),
+        'pairs_with_estimated_duration': len(pair_estimated),
         'pairs_with_action_vars': sum(1 for r in rows if r['动作变量']),
         'pairs_with_step_comment': sum(1 for r in rows if r['动作描述']),
         'pairs_reset_exit': sum(1 for r in rows if '复位退出' in r['备注']),
@@ -406,6 +451,7 @@ def generate(trace_path, run, source=None, proc_name=None,
             'segments': str(run / 'trace_segments.csv'),
             'cycles': str(run / 'trace_cycles.json'),
             'review': str(run / 'trace_pairs_review.csv'),
+            'summary': str(run / 'trace_pairs_summary.json'),
         },
     }
     (run / 'trace_pairs_summary.json').write_text(
@@ -414,39 +460,47 @@ def generate(trace_path, run, source=None, proc_name=None,
     return summary
 
 
-def load_trace_duration_map(run):
-    """Load trace_collection_pairs.csv duration column for xlsx backfill.
-
-    Returns dict: (start_label, end_label) -> median_duration_ms (int or None).
-    Returns {} when file doesn't exist (not a trace-mode run).
-    """
+def load_trace_timing(run):
+    """Read median durations and the pairs that include estimated timing."""
     p = Path(run) / 'trace_collection_pairs.csv'
-    if not p.exists():
-        return {}
-    rt = {}
-    with open(p, encoding='utf-8-sig', newline='') as f:
+    durations, estimated = {}, set()
+    if not p.is_file():
+        return durations, estimated
+    with p.open(encoding='utf-8-sig', newline='') as f:
         for row in csv.DictReader(f):
             dur = (row.get('中位数时长ms') or '').strip()
             key = (row.get('开始标签', ''), row.get('结束标签', ''))
             try:
-                rt[key] = int(dur) if dur else None
+                durations[key] = int(dur) if dur else None
             except ValueError:
-                rt[key] = None
-    return rt
+                durations[key] = None
+            estimate_count = (row.get('估算时长次数') or '').strip()
+            if estimate_count.isdecimal() and int(estimate_count) > 0:
+                estimated.add(key)
+    return durations, estimated
+
+
+def load_trace_duration_map(run):
+    """Return {(start_label, end_label): median_duration_ms} for Excel backfill."""
+    return load_trace_timing(run)[0]
 
 
 def main():
     import argparse
     ap = argparse.ArgumentParser(description='trace → step pairs extraction')
-    ap.add_argument('--trace', required=True, help='.trace 文件路径')
+    ap.add_argument('--trace', required=True, help='.trace 文件、Sysmac CSV/TSV/TXT，或同次采集的分卷目录')
     ap.add_argument('--run', required=True, help='run目录（含源码证据文件）')
     ap.add_argument('--source', default=None, help='源码XML（推断工序名用）')
     ap.add_argument('--proc-name', default=None, help='工序名')
     ap.add_argument('--idle-threshold', type=int, default=5000,
                     help='周期检测空闲阈值(ms)，默认5000')
+    ap.add_argument('--pattern', help='完整变量名的 glob 或 re: 模式')
+    ap.add_argument('--sample-interval-ms', type=float,
+                    help='RawTime 精度不足时使用的 Sysmac 采样间隔(ms)')
     a = ap.parse_args()
     stats = generate(a.trace, a.run, a.source, a.proc_name,
-                     idle_threshold_ms=a.idle_threshold)
+                     idle_threshold_ms=a.idle_threshold, pattern=a.pattern,
+                     sample_interval_ms=a.sample_interval_ms)
     print(json.dumps(stats, ensure_ascii=False, indent=2))
 
 
